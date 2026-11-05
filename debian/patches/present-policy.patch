@@ -1,0 +1,812 @@
+Description: Export opaque Present policy function tables
+ Keep native resource operations in Xorg and scheduling policy in modules.
+ The private interface does not require a custom SDK or an exact core version.
+Origin: local
+Forwarded: no
+---
+diff --git a/hw/xfree86/sdksyms.sh b/hw/xfree86/sdksyms.sh
+--- a/hw/xfree86/sdksyms.sh
++++ b/hw/xfree86/sdksyms.sh
+@@ -95,6 +95,9 @@
+ #include "xf86Modes.h"
+ #include "xf86RandR12.h"
+ /* #include "xf86Rename.h" */
++#ifdef PRESENT
++#include "present.h"
++#endif
+ 
+ 
+ /* hw/xfree86/ddc/Makefile.am */
+diff --git a/present/present.h b/present/present.h
+--- a/present/present.h
++++ b/present/present.h
+@@ -24,6 +24,7 @@
+ #define _PRESENT_H_
+ 
+ #include <X11/extensions/presentproto.h>
++#include <stdint.h>
+ #include "randrstr.h"
+ #include "presentext.h"
+ 
+@@ -139,6 +140,12 @@
+ 
+ } present_screen_info_rec, *present_screen_info_ptr;
+ 
++struct present_policy_host_v3;
++struct present_policy_hooks_v3;
++extern _X_EXPORT const struct present_policy_host_v3 *
++present_policy_register_v3(const void *, const struct present_policy_hooks_v3 *);
++extern _X_EXPORT void present_policy_unregister_v3(const void *);
++
+ /*
+  * Called when 'event_id' occurs. 'ust' and 'msc' indicate when the
+  * event actually happened
+diff --git a/present/present_priv.h b/present/present_priv.h
+--- a/present/present_priv.h
++++ b/present/present_priv.h
+@@ -31,6 +31,7 @@
+ #include "windowstr.h"
+ #include "dixstruct.h"
+ #include "present.h"
++#include "present_policy_abi.h"
+ #include <syncsdk.h>
+ #include <syncsrv.h>
+ #include <xfixes.h>
+@@ -89,6 +90,7 @@
+     Bool                sync_flip;      /* do flip synchronous to vblank */
+     Bool                abort_flip;     /* aborting this flip */
+     PresentFlipReason   reason;         /* reason for which flip is not possible */
++    void                *policy_data;   /* opaque module state, native never interprets */
+     Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
+ };
+ 
+@@ -335,11 +337,25 @@
+ Bool
+ present_execute_wait(present_vblank_ptr vblank, uint64_t crtc_msc);
+ 
+-void
++Bool
+ present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc);
++void present_execute_copy_native(present_vblank_ptr vblank);
+ 
+ void
+ present_execute_post(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc);
++
++extern const PresentPolicyHooksV3 *present_policy_hooks;
++extern Bool present_policy_ready;
++void present_policy_reset(void);
++void present_policy_view(PresentPolicyRequest *, PresentPolicyView *);
++void *present_policy_get_data(PresentPolicyRequest *);
++void present_policy_set_data(PresentPolicyRequest *, void *);
++void present_policy_visit(PresentPolicyWindow, void (*)(PresentPolicyRequest *, void *), void *);
++Bool present_policy_retain(PresentPolicyRequest *, uint64_t);
++Bool present_policy_finish_copy(PresentPolicyRequest *, uint64_t, uint64_t);
++Bool present_policy_supersede(PresentPolicyRequest *, PresentPolicyRequest *, Bool, uint64_t, uint64_t);
++void present_policy_clock(PresentPolicyRequest *, uint64_t *, uint64_t *);
++void present_policy_abort_native(present_vblank_ptr);
+ 
+ /*
+  * present_fake.c
+diff --git a/present/present.c b/present/present.c
+--- a/present/present.c
++++ b/present/present.c
+@@ -22,6 +22,119 @@
+ 
+ #include "present_priv.h"
+ #include <gcstruct.h>
++#include <X11/Xatom.h>
++#include "propertyst.h"
++
++static DevPrivateKeyRec policy_window_key;
++
++static Bool
++policy_crtc_valid(PresentPolicyWindow handle, PresentPolicyCrtc crtc)
++{
++    WindowPtr window = handle;
++    return window && crtc && RRCrtcExists(window->drawable.pScreen, crtc);
++}
++
++static void *
++policy_screen(PresentPolicyWindow handle, PresentPolicyCrtc crtc)
++{
++    WindowPtr window = handle;
++    RRCrtcPtr native_crtc = crtc;
++    if (!window)
++        return NULL;
++    if (!crtc)
++        return window->drawable.pScreen;
++    return policy_crtc_valid(window, crtc) ? native_crtc->pScreen : NULL;
++}
++
++static uint32_t
++policy_crtc_id(PresentPolicyWindow window, PresentPolicyCrtc crtc)
++{
++    RRCrtcPtr native_crtc = crtc;
++    return policy_crtc_valid(window, crtc) ? (uint32_t) native_crtc->id : 0;
++}
++
++static Bool
++policy_window_name(PresentPolicyWindow handle, char *buffer, uint32_t size)
++{
++    WindowPtr current = handle;
++    if (!current || size < 2)
++        return FALSE;
++    for (; current; current = current->parent) {
++        PropertyPtr property;
++        for (property = wUserProps(current); property; property = property->next) {
++            size_t length;
++            if (property->propertyName != XA_WM_NAME ||
++                property->type != XA_STRING || property->format != 8 ||
++                !property->data)
++                continue;
++            length = property->size;
++            if (length >= size)
++                length = size - 1;
++            memcpy(buffer, property->data, length);
++            buffer[length] = '\0';
++            return TRUE;
++        }
++    }
++    return FALSE;
++}
++
++static void *
++policy_window_data(PresentPolicyWindow handle)
++{
++    WindowPtr window = handle;
++    return window ? dixLookupPrivate(&window->devPrivates, &policy_window_key) : NULL;
++}
++
++const PresentPolicyHooksV3 *present_policy_hooks;
++static const void *present_policy_provider;
++static Bool present_policy_stopping;
++Bool present_policy_ready;
++static const PresentPolicyHostV3 present_policy_host = {
++    PRESENT_POLICY_ABI_V3, sizeof(PresentPolicyHostV3),
++    present_policy_view, present_policy_get_data, present_policy_set_data, present_policy_visit,
++    present_policy_retain, present_policy_finish_copy, present_policy_supersede,
++    present_policy_clock, policy_screen, policy_crtc_valid, policy_crtc_id,
++    policy_window_name, policy_window_data
++};
++
++const PresentPolicyHostV3 *
++present_policy_register_v3(const void *provider, const PresentPolicyHooksV3 *hooks)
++{
++    if (!provider || !hooks || !present_policy_ready || present_policy_provider || present_policy_stopping ||
++        hooks->abi_version != PRESENT_POLICY_ABI_V3 ||
++        hooks->struct_size != sizeof(PresentPolicyHooksV3) ||
++        !hooks->destroying || !hooks->shutdown ||
++        !hooks->window_data_size || hooks->window_data_size > 4096)
++        return NULL;
++    if (policy_window_key.initialized &&
++        policy_window_key.size != (int) hooks->window_data_size)
++        return NULL;
++    if (!dixRegisterPrivateKey(&policy_window_key, PRIVATE_WINDOW, hooks->window_data_size))
++        return NULL;
++    present_policy_provider = provider;
++    present_policy_hooks = hooks;
++    return &present_policy_host;
++}
++
++void
++present_policy_unregister_v3(const void *provider)
++{
++    if (!provider || provider != present_policy_provider || present_policy_stopping)
++        return;
++    present_policy_stopping = TRUE;
++    /* Module cancels its timers and drains retained requests while its
++     * destroying callback and the host operations are still available. */
++    present_policy_hooks->shutdown();
++    present_policy_hooks = NULL;
++    present_policy_provider = NULL;
++    present_policy_stopping = FALSE;
++}
++
++void
++present_policy_reset(void)
++{
++    present_policy_unregister_v3(present_policy_provider);
++}
+ 
+ uint32_t
+ present_query_capabilities(RRCrtcPtr crtc)
+@@ -240,6 +353,10 @@
+     ScreenPtr                   screen = window->drawable.pScreen;
+     present_screen_priv_ptr     screen_priv = present_screen_priv(screen);
+ 
++    if (pixmap && present_policy_hooks && present_policy_hooks->force_copy &&
++        present_policy_hooks->force_copy(window))
++        options |= PresentOptionCopy;
++
+     return screen_priv->present_pixmap(window,
+                                        pixmap,
+                                        serial,
+diff --git a/present/present_execute.c b/present/present_execute.c
+--- a/present/present_execute.c
++++ b/present/present_execute.c
+@@ -37,19 +37,47 @@
+     screen_priv->re_execute(vblank);
+ }
+ 
++static Bool
++present_execute_queue_vblank(present_vblank_ptr vblank, uint64_t crtc_msc)
++{
++    WindowPtr window = vblank->window;
++    ScreenPtr screen = window->drawable.pScreen;
++    present_screen_priv_ptr screen_priv = present_screen_priv(screen);
++    Bool target = FALSE;
++    uint64_t queue_msc;
++
++    /* Neither queue path can target the next MSC in this case. */
++    if (vblank->exec_msc != crtc_msc + 1 &&
++        (!vblank->crtc || vblank->target_msc != crtc_msc + 1))
++        return FALSE;
++
++    if (present_policy_hooks && present_policy_hooks->queue_target)
++        target = present_policy_hooks->queue_target(window, vblank->crtc,
++                                                     vblank->target_msc, crtc_msc);
++
++    /* A policy may request the target MSC only for a real CRTC. Without one,
++     * preserve the existing fake-vblank scheduling path.
++     */
++    if (target && vblank->crtc)
++        queue_msc = vblank->target_msc;
++    else
++        queue_msc = vblank->exec_msc;
++
++    if (queue_msc != crtc_msc + 1)
++        return FALSE;
++
++    return screen_priv->queue_vblank(screen, window, vblank->crtc,
++                                     vblank->event_id, queue_msc) == Success;
++}
++
+ Bool
+ present_execute_wait(present_vblank_ptr vblank, uint64_t crtc_msc)
+ {
+-    WindowPtr                   window = vblank->window;
+-    ScreenPtr                   screen = window->drawable.pScreen;
+-    present_screen_priv_ptr screen_priv = present_screen_priv(screen);
+ 
+     /* We may have to requeue for the next MSC if check_flip_window prevented
+      * using a flip.
+      */
+-    if (vblank->exec_msc == crtc_msc + 1 &&
+-        screen_priv->queue_vblank(screen, window, vblank->crtc, vblank->event_id,
+-                                  vblank->exec_msc) == Success)
++    if (present_execute_queue_vblank(vblank, crtc_msc))
+         return TRUE;
+ 
+     if (vblank->wait_fence) {
+@@ -61,24 +89,28 @@
+     return FALSE;
+ }
+ 
+-void
++Bool
+ present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)
+ {
+-    WindowPtr                   window = vblank->window;
+-    ScreenPtr                   screen = window->drawable.pScreen;
+-    present_screen_priv_ptr screen_priv = present_screen_priv(screen);
+ 
+     /* If present_flip failed, we may have to requeue for the next MSC */
+-    if (vblank->exec_msc == crtc_msc + 1 &&
+-        Success == screen_priv->queue_vblank(screen,
+-                                             window,
+-                                             vblank->crtc,
+-                                             vblank->event_id,
+-                                             vblank->exec_msc)) {
++    if (present_execute_queue_vblank(vblank, crtc_msc)) {
+         vblank->queued = TRUE;
+-        return;
++        return FALSE;
+     }
+ 
++    if (present_policy_hooks && present_policy_hooks->copy &&
++        present_policy_hooks->copy((PresentPolicyRequest *) vblank, crtc_msc) != PRESENT_POLICY_NATIVE)
++        return TRUE;
++    present_execute_copy_native(vblank);
++    return FALSE;
++}
++
++void
++present_execute_copy_native(present_vblank_ptr vblank)
++{
++    WindowPtr window = vblank->window;
++    present_screen_priv_ptr screen_priv = present_screen_priv(window->drawable.pScreen);
+     present_copy_region(&window->drawable, vblank->pixmap, vblank->update, vblank->x_off, vblank->y_off);
+ 
+     /* present_copy_region sticks the region into a scratch GC,
+diff --git a/present/present_scmd.c b/present/present_scmd.c
+--- a/present/present_scmd.c
++++ b/present/present_scmd.c
+@@ -58,6 +58,34 @@
+ }
+ 
+ static Bool
++present_driver_check_flip(present_screen_priv_ptr screen_priv,
++                          RRCrtcPtr crtc,
++                          WindowPtr window,
++                          PixmapPtr pixmap,
++                          Bool sync_flip,
++                          PresentFlipReason *reason)
++{
++    if (screen_priv->info->version >= 1 && screen_priv->info->check_flip2) {
++        if (!(*screen_priv->info->check_flip2)(crtc, window, pixmap,
++                                               sync_flip, reason)) {
++            DebugPresent(("\td %08" PRIx32 " -> %08" PRIx32 "\n",
++                          window->drawable.id,
++                          pixmap ? pixmap->drawable.id : 0));
++            return FALSE;
++        }
++    } else if (screen_priv->info->check_flip &&
++               !(*screen_priv->info->check_flip)(crtc, window, pixmap,
++                                                  sync_flip)) {
++        DebugPresent(("\td %08" PRIx32 " -> %08" PRIx32 "\n",
++                      window->drawable.id,
++                      pixmap ? pixmap->drawable.id : 0));
++        return FALSE;
++    }
++
++    return TRUE;
++}
++
++static Bool
+ present_check_flip(RRCrtcPtr            crtc,
+                    WindowPtr            window,
+                    PixmapPtr            pixmap,
+@@ -71,13 +99,17 @@
+     PixmapPtr                   window_pixmap;
+     WindowPtr                   root = screen->root;
+     present_screen_priv_ptr     screen_priv = present_screen_priv(screen);
+-
+-    if (crtc) {
+-       screen_priv = present_screen_priv(crtc->pScreen);
+-    }
++    Bool                        driver_first = FALSE;
++    PresentFlipReason           driver_reason = PRESENT_FLIP_REASON_UNKNOWN;
++    Bool                        driver_checked = FALSE;
++
+     if (reason)
+         *reason = PRESENT_FLIP_REASON_UNKNOWN;
+ 
++    /* Driver callbacks and this pending-pixmap lookup follow the target CRTC. */
++    if (crtc)
++        screen_priv = present_screen_priv(crtc->pScreen);
++
+     if (!screen_priv)
+         return FALSE;
+ 
+@@ -90,6 +122,19 @@
+     /* Check to see if the driver supports flips at all */
+     if (!screen_priv->info->flip)
+         return FALSE;
++
++    if (present_policy_hooks && present_policy_hooks->driver_first)
++        driver_first = present_policy_hooks->driver_first(window, crtc);
++    if (driver_first) {
++        driver_checked = TRUE;
++        if (!present_driver_check_flip(screen_priv, crtc, window, pixmap,
++                                       sync_flip, &driver_reason) &&
++            driver_reason != PRESENT_FLIP_REASON_BUFFER_FORMAT) {
++            if (reason)
++                *reason = driver_reason;
++            return FALSE;
++        }
++    }
+ 
+     /* Make sure the window hasn't been redirected with Composite */
+     window_pixmap = screen->GetWindowPixmap(window);
+@@ -123,17 +168,16 @@
+         return FALSE;
+     }
+ 
+-    /* Ask the driver for permission */
+-    if (screen_priv->info->version >= 1 && screen_priv->info->check_flip2) {
+-        if (!(*screen_priv->info->check_flip2) (crtc, window, pixmap, sync_flip, reason)) {
+-            DebugPresent(("\td %08" PRIx32 " -> %08" PRIx32 "\n", window->drawable.id, pixmap ? pixmap->drawable.id : 0));
++    if (driver_first) {
++        if (driver_reason == PRESENT_FLIP_REASON_BUFFER_FORMAT) {
++            if (reason)
++                *reason = driver_reason;
+             return FALSE;
+         }
+-    } else if (screen_priv->info->check_flip) {
+-        if (!(*screen_priv->info->check_flip) (crtc, window, pixmap, sync_flip)) {
+-            DebugPresent(("\td %08" PRIx32 " -> %08" PRIx32 "\n", window->drawable.id, pixmap ? pixmap->drawable.id : 0));
+-            return FALSE;
+-        }
++    } else if (!driver_checked &&
++               !present_driver_check_flip(screen_priv, crtc, window, pixmap,
++                                          sync_flip, reason)) {
++        return FALSE;
+     }
+ 
+     return TRUE;
+@@ -537,6 +581,9 @@
+     WindowPtr                   window = vblank->window;
+     ScreenPtr                   screen = window->drawable.pScreen;
+     present_screen_priv_ptr     screen_priv = present_screen_priv(screen);
++    if (present_policy_hooks && present_policy_hooks->execute &&
++        present_policy_hooks->execute((PresentPolicyRequest *) vblank, ust, crtc_msc) != PRESENT_POLICY_NATIVE)
++        return;
+     if (vblank && vblank->crtc) {
+         screen_priv=present_screen_priv(vblank->crtc->pScreen);
+     }
+@@ -626,7 +673,8 @@
+                 present_unflip(screen);
+         }
+ 
+-        present_execute_copy(vblank, crtc_msc);
++        if (present_execute_copy(vblank, crtc_msc))
++            return;
+ 
+         if (vblank->queued) {
+             xorg_list_add(&vblank->event_queue, &present_exec_queue);
+@@ -686,6 +734,7 @@
+     uint64_t                    target_msc;
+     uint64_t                    crtc_msc = 0;
+     int                         ret;
++    PresentPolicySubmit         submit;
+     present_vblank_ptr          vblank, tmp;
+     ScreenPtr                   screen = window->drawable.pScreen;
+     present_window_priv_ptr     window_priv = present_get_window_priv(window, TRUE);
+@@ -706,6 +755,9 @@
+             target_crtc = present_get_crtc(window);
+     }
+ 
++    if (target_crtc && present_policy_hooks &&
++        !RRCrtcExists(window->drawable.pScreen, target_crtc))
++        target_crtc = NULL;
+     ret = present_get_ust_msc(screen, target_crtc, &ust, &crtc_msc);
+ 
+     present_scmd_update_window_crtc(window, target_crtc, crtc_msc);
+@@ -722,6 +774,18 @@
+                                         remainder,
+                                         options);
+ 
++    if (present_policy_hooks) {
++        submit = (PresentPolicySubmit) {
++            window, target_crtc, target_msc, crtc_msc,
++            ret == Success, pixmap != NULL, !valid && !update && !x_off && !y_off,
++            !wait_fence, pixmap && pixmap->drawable.width == window->drawable.width &&
++                         pixmap->drawable.height == window->drawable.height,
++            (options & PresentOptionAsync) && target_msc == crtc_msc && !divisor && !remainder, NULL
++        };
++        if (present_policy_hooks->before_submit)
++            present_policy_hooks->before_submit(&submit);
++    }
++
+     /*
+      * Look for a matching presentation already on the list and
+      * don't bother doing the previous one if this one will overwrite it
+@@ -731,7 +795,9 @@
+     if (!update && pixmap) {
+         xorg_list_for_each_entry_safe(vblank, tmp, &window_priv->vblank, window_list) {
+ 
+-            if (!vblank->pixmap)
++            if (!vblank->pixmap ||
++                (present_policy_hooks && present_policy_hooks->retained &&
++                 present_policy_hooks->retained((PresentPolicyRequest *) vblank)))
+                 continue;
+ 
+             if (!vblank->queued)
+@@ -766,6 +832,10 @@
+     if (!vblank)
+         return BadAlloc;
+ 
++    if (present_policy_hooks && present_policy_hooks->created &&
++        present_policy_hooks->created((PresentPolicyRequest *) vblank, &submit, ust) != PRESENT_POLICY_NATIVE)
++        return Success;
++
+     vblank->event_id = ++present_scmd_event_id;
+ 
+     if (vblank->flip && vblank->sync_flip)
+@@ -851,11 +921,140 @@
+     screen_priv->flip_destroy       =   &present_scmd_flip_destroy;
+ }
+ 
++
++/* Opaque native operations. Only these functions write native request resources. */
++#define POLICY_REQUEST(r) ((present_vblank_ptr) (r))
++void
++present_policy_view(PresentPolicyRequest *request, PresentPolicyView *view)
++{
++    present_vblank_ptr v = POLICY_REQUEST(request);
++    *view = (PresentPolicyView) {
++        v->window, v->crtc, v->target_msc, v->exec_msc, v->event_id,
++        v->pixmap != NULL, !v->valid && !v->update && !v->x_off && !v->y_off,
++        !v->wait_fence || present_fence_check_triggered(v->wait_fence),
++        v->pixmap && v->pixmap->drawable.width == v->window->drawable.width &&
++                     v->pixmap->drawable.height == v->window->drawable.height,
++        v->flip, v->queued, v->crtc && RRCrtcExists(v->screen, v->crtc), v->policy_data
++    };
++}
++
++void *present_policy_get_data(PresentPolicyRequest *r) { return POLICY_REQUEST(r)->policy_data; }
++
++void present_policy_set_data(PresentPolicyRequest *r, void *data) { POLICY_REQUEST(r)->policy_data = data; }
++
++void
++present_policy_visit(PresentPolicyWindow handle, void (*visit)(PresentPolicyRequest *, void *), void *data)
++{
++    WindowPtr window = handle;
++    present_window_priv_ptr priv = present_get_window_priv(window, FALSE);
++    present_vblank_ptr v;
++    if (priv)
++        xorg_list_for_each_entry(v, &priv->vblank, window_list)
++            visit((PresentPolicyRequest *) v, data);
++}
++
++void
++present_policy_abort_native(present_vblank_ptr v)
++{
++    Bool queued = v->queued;
++    xorg_list_del(&v->event_queue);
++    v->queued = FALSE;
++    if (v->crtc && !RRCrtcExists(v->screen, v->crtc))
++        v->crtc = NULL;
++    if (queued && v->crtc)
++        present_screen_priv(v->screen)->abort_vblank(v->screen, v->window, v->crtc,
++                                                    v->event_id, v->target_msc);
++}
++
++void
++present_policy_clock(PresentPolicyRequest *request, uint64_t *ust, uint64_t *msc)
++{
++    present_vblank_ptr v = POLICY_REQUEST(request);
++    uint64_t live_ust, live_msc;
++    *ust = GetTimeInMicros();
++    if (v->crtc && RRCrtcExists(v->screen, v->crtc) &&
++        present_get_ust_msc(v->screen, v->crtc, &live_ust, &live_msc) == Success) {
++        *ust = live_ust;
++        *msc = live_msc;
++    }
++}
++
++Bool
++present_policy_retain(PresentPolicyRequest *request, uint64_t target)
++{
++    present_vblank_ptr v = POLICY_REQUEST(request);
++    uint64_t old_target = v->target_msc, old_exec = v->exec_msc;
++    if (!v->pixmap || v->flip || v->wait_fence || v->valid || v->update ||
++        v->x_off || v->y_off || v->pixmap->drawable.width != v->window->drawable.width ||
++        v->pixmap->drawable.height != v->window->drawable.height || !v->crtc ||
++        !RRCrtcExists(v->screen, v->crtc) || v->queued)
++        return FALSE;
++    v->target_msc = v->exec_msc = target;
++    if (present_screen_priv(v->screen)->queue_vblank(v->screen, v->window, v->crtc,
++                                                    v->event_id, target) != Success) {
++        v->target_msc = old_target;
++        v->exec_msc = old_exec;
++        return FALSE;
++    }
++    v->queued = TRUE;
++    xorg_list_del(&v->event_queue);
++    xorg_list_del(&v->window_list);
++    xorg_list_append(&v->event_queue, &present_exec_queue);
++    xorg_list_append(&v->window_list, &present_get_window_priv(v->window, TRUE)->vblank);
++    return TRUE;
++}
++
++Bool
++present_policy_finish_copy(PresentPolicyRequest *request, uint64_t ust, uint64_t msc)
++{
++    present_vblank_ptr v = POLICY_REQUEST(request);
++    if (!v->pixmap || v->flip ||
++        (v->wait_fence && !present_fence_check_triggered(v->wait_fence)))
++        return FALSE;
++    present_policy_abort_native(v);
++    present_execute_copy_native(v);
++    present_execute_post(v, ust, msc);
++    return TRUE; /* request consumed */
++}
++
++Bool
++present_policy_supersede(PresentPolicyRequest *pending, PresentPolicyRequest *newer,
++                         Bool keep_carrier, uint64_t ust, uint64_t msc)
++{
++    present_vblank_ptr p = POLICY_REQUEST(pending), n = POLICY_REQUEST(newer);
++    if (p == n || !p->queued || n->queued || p->window != n->window ||
++        p->screen != n->screen || p->crtc != n->crtc || !p->crtc ||
++        !RRCrtcExists(p->screen, p->crtc) || !p->pixmap || !n->pixmap ||
++        p->kind != PresentCompleteKindPixmap || n->kind != PresentCompleteKindPixmap ||
++        p->valid || n->valid || p->update || n->update || p->wait_fence || n->wait_fence ||
++        p->x_off || p->y_off || n->x_off || n->y_off || p->flip || n->flip ||
++        p->pixmap->drawable.width != n->pixmap->drawable.width ||
++        p->pixmap->drawable.height != n->pixmap->drawable.height || n->target_msc != msc)
++        return FALSE;
++    if (keep_carrier) {
++#define SWAP(type, field) do { type saved = p->field; p->field = n->field; n->field = saved; } while (0)
++        SWAP(PixmapPtr, pixmap); SWAP(uint32_t, serial);
++        SWAP(present_fence_ptr, idle_fence); SWAP(uint64_t, msc_offset);
++        SWAP(present_notify_ptr, notifies); SWAP(int, num_notifies);
++        SWAP(Bool, has_suboptimal); SWAP(PresentFlipReason, reason);
++#undef SWAP
++        p = n;
++    } else {
++        present_policy_abort_native(p);
++    }
++    present_vblank_scrap(p);
++    present_execute_post(p, ust, msc);
++    return TRUE;
++}
++#undef POLICY_REQUEST
++
+ Bool
+ present_init(void)
+ {
++    present_policy_reset();
+     xorg_list_init(&present_exec_queue);
+     xorg_list_init(&present_flip_queue);
+     present_fake_queue_init();
++    present_policy_ready = TRUE;
+     return TRUE;
+ }
+diff --git a/present/present_screen.c b/present/present_screen.c
+--- a/present/present_screen.c
++++ b/present/present_screen.c
+@@ -77,7 +77,11 @@
+     present_vblank_ptr          vblank, tmp;
+ 
+     xorg_list_for_each_entry_safe(vblank, tmp, &window_priv->vblank, window_list) {
+-        screen_priv->abort_vblank(window->drawable.pScreen, window, vblank->crtc, vblank->event_id, vblank->target_msc);
++        if (present_policy_hooks && present_policy_hooks->retained &&
++            present_policy_hooks->retained((PresentPolicyRequest *) vblank))
++            present_policy_abort_native(vblank);
++        else
++            screen_priv->abort_vblank(window->drawable.pScreen, window, vblank->crtc, vblank->event_id, vblank->target_msc);
+         present_vblank_destroy(vblank);
+     }
+ }
+@@ -217,6 +221,14 @@
+ /*
+  * Initialize the present extension
+  */
++static void
++present_close_down(ExtensionEntry *extension)
++{
++    (void) extension;
++    present_policy_ready = FALSE;
++    present_policy_reset();
++}
++
+ void
+ present_extension_init(void)
+ {
+@@ -230,7 +242,7 @@
+ 
+     extension = AddExtension(PRESENT_NAME, PresentNumberEvents, PresentNumberErrors,
+                              proc_present_dispatch, sproc_present_dispatch,
+-                             NULL, StandardMinorOpcode);
++                             present_close_down, StandardMinorOpcode);
+     if (!extension)
+         goto bail;
+ 
+diff --git a/present/present_vblank.c b/present/present_vblank.c
+--- a/present/present_vblank.c
++++ b/present/present_vblank.c
+@@ -200,6 +200,8 @@
+ void
+ present_vblank_destroy(present_vblank_ptr vblank)
+ {
++    if (present_policy_hooks)
++        present_policy_hooks->destroying((PresentPolicyRequest *) vblank);
+     /* Remove vblank from window and screen lists */
+     xorg_list_del(&vblank->window_list);
+     /* Also make sure vblank is removed from event queue (wnmd) */
+diff --git a/dri3/dri3_screen.c b/dri3/dri3_screen.c
+--- a/dri3/dri3_screen.c
++++ b/dri3/dri3_screen.c
+@@ -27,6 +27,10 @@
+ #include <randrstr.h>
+ #include <drm_fourcc.h>
+ #include <unistd.h>
++#ifdef PRESENT
++#include "../present/present_policy_abi.h"
++extern const PresentPolicyHooksV3 *present_policy_hooks;
++#endif
+ 
+ int
+ dri3_open(ClientPtr client, ScreenPtr screen, RRProviderPtr provider, int *fd)
+@@ -300,6 +304,13 @@
+ 
+     *intersect_modifiers = intersect_mods;
+     *screen_modifiers = screen_mods;
++#ifdef PRESENT
++    if (present_policy_hooks && present_policy_hooks->modifiers && drawable &&
++        drawable->type == DRAWABLE_WINDOW && drawable->pScreen == screen)
++        present_policy_hooks->modifiers((WindowPtr) drawable, format, depth, bpp,
++                                         num_intersect_modifiers, intersect_modifiers,
++                                         num_screen_modifiers, screen_modifiers);
++#endif
+     free(drawable_mods);
+ 
+     return Success;
+diff --git a/present/Makefile.am b/present/Makefile.am
+--- a/present/Makefile.am
++++ b/present/Makefile.am
+@@ -11,6 +11,7 @@
+ 	present_fence.c \
+ 	present_notify.c \
+ 	present_priv.h \
++	present_policy_abi.h \
+ 	present_request.c \
+ 	present_scmd.c \
+ 	present_screen.c \
+diff --git a/present/present_policy_abi.h b/present/present_policy_abi.h
+--- /dev/null
++++ b/present/present_policy_abi.h
+@@ -0,0 +1,71 @@
++/* Internal contract, independently declared by host and module.
++ * No Xorg SDK/private types or installed policy SDK are required.
++ * All calls run synchronously on the server thread. Handles are borrowed;
++ * request handles become invalid after destroying or a CONSUMED result.
++ */
++#ifndef PRESENT_POLICY_ABI_H
++#define PRESENT_POLICY_ABI_H
++#include <stdint.h>
++#define PRESENT_POLICY_ABI_V3 3
++
++typedef void *PresentPolicyWindow;
++typedef void *PresentPolicyCrtc;
++typedef struct present_policy_request PresentPolicyRequest;
++typedef enum {
++    PRESENT_POLICY_NATIVE,
++    PRESENT_POLICY_RETAINED,
++    PRESENT_POLICY_CONSUMED
++} PresentPolicyResult;
++typedef struct {
++    PresentPolicyWindow window;
++    PresentPolicyCrtc crtc;
++    uint64_t target_msc, current_msc;
++    int clock_valid, pixmap, full, ready, sized, immediate;
++    void *data; /* Submit-stack cookie; never retain its address. */
++} PresentPolicySubmit;
++typedef struct {
++    PresentPolicyWindow window;
++    PresentPolicyCrtc crtc;
++    uint64_t target_msc, exec_msc, event_id;
++    int pixmap, full, ready, sized, flip, queued, live_crtc;
++    void *data;
++} PresentPolicyView;
++typedef struct present_policy_host_v3 {
++    uint32_t abi_version, struct_size;
++    void (*view)(PresentPolicyRequest *, PresentPolicyView *);
++    void *(*get_data)(PresentPolicyRequest *);
++    void (*set_data)(PresentPolicyRequest *, void *);
++    /* Read-only traversal; no request/resource mutations in the visitor. */
++    void (*visit)(PresentPolicyWindow, void (*)(PresentPolicyRequest *, void *), void *);
++    int (*retain)(PresentPolicyRequest *, uint64_t);
++    /* Success consumes the handle through native Copy/Idle/Complete/cleanup. */
++    int (*finish_copy)(PresentPolicyRequest *, uint64_t, uint64_t);
++    /* True consumes newer when keep_carrier, otherwise consumes pending. */
++    int (*supersede)(PresentPolicyRequest *, PresentPolicyRequest *, int,
++                      uint64_t, uint64_t);
++    void (*clock)(PresentPolicyRequest *, uint64_t *, uint64_t *);
++    void *(*screen)(PresentPolicyWindow, PresentPolicyCrtc);
++    int (*crtc_valid)(PresentPolicyWindow, PresentPolicyCrtc);
++    uint32_t (*crtc_id)(PresentPolicyWindow, PresentPolicyCrtc);
++    int (*window_name)(PresentPolicyWindow, char *, uint32_t);
++    /* Host-owned zeroed POD storage, sized by hooks->window_data_size. */
++    void *(*window_data)(PresentPolicyWindow);
++} PresentPolicyHostV3;
++typedef struct present_policy_hooks_v3 {
++    uint32_t abi_version, struct_size, window_data_size;
++    int (*force_copy)(PresentPolicyWindow);
++    int (*queue_target)(PresentPolicyWindow, PresentPolicyCrtc, uint64_t, uint64_t);
++    int (*driver_first)(PresentPolicyWindow, PresentPolicyCrtc);
++    void (*before_submit)(PresentPolicySubmit *);
++    PresentPolicyResult (*created)(PresentPolicyRequest *, const PresentPolicySubmit *, uint64_t);
++    PresentPolicyResult (*execute)(PresentPolicyRequest *, uint64_t, uint64_t);
++    PresentPolicyResult (*copy)(PresentPolicyRequest *, uint64_t);
++    int (*retained)(PresentPolicyRequest *);
++    void (*destroying)(PresentPolicyRequest *);
++    /* Drain retained requests/cancel timers before host clears callbacks. */
++    void (*shutdown)(void);
++    /* Request-owned malloc arrays; allocate before commit, preserve on OOM. */
++    void (*modifiers)(PresentPolicyWindow, uint32_t, uint8_t, uint8_t,
++                       uint32_t *, uint64_t **, uint32_t *, uint64_t **);
++} PresentPolicyHooksV3;
++#endif

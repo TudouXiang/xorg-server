@@ -1,5 +1,6 @@
 xorg-server (2:21.1.16-1deepin12) unstable; urgency=medium
 
+  * Export optional opaque Present policy function tables for modules.
   * fix(cve): CVE-2026-93515 (unknown) - present: unlink notifies from
     window list in present_clear_window_notifies   Upstream:
     https://gitlab.freedesktop.org/xorg/xserver/-
